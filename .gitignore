@@ -41,9 +41,7 @@ data/processed/*
 !data/processed/.gitkeep
 
 # Models
-models/*.pkl
-models/*.h5
-models/*.pt
+models/
 
 # Logs
 logs/
