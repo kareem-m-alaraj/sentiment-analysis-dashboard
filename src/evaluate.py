@@ -1,37 +1,51 @@
 """
 evaluate.py
-Scores cardiffnlp/twitter-roberta-base-sentiment-latest predictions against
-sentiment140 ground truth. Only twitter rows carry a label (posts.raw_label:
-0=negative, 4=positive) -- reddit rows have raw_label NULL and are excluded
-by the ground-truth filter itself, no source check needed.
+Scores a sentiment model against sentiment140 ground truth (posts.raw_label:
+0=negative, 4=positive), restricted to the fixed held-out test set written
+by finetune.py to `test_split`. Reddit rows have raw_label NULL and never
+appear here.
 
-The model has 3 classes (neg/neu/pos) but ground truth is 2-way, so this
-reports both views:
+--model zeroshot (default) -- cardiffnlp/twitter-roberta-base-sentiment-latest,
+    the pretrained 3-class (neg/neu/pos) checkpoint. Reports both views:
+      STRICT -- score only rows the model called negative/positive; neutral
+                predictions count as abstentions. Reports accuracy + coverage.
+      FORCED -- every row gets a 2-way call. Rows already predicted
+                negative/positive keep that call. Neutral rows are re-run
+                picking whichever of P(neg)/P(pos) is higher (predictions
+                only stores the winning label, not full probabilities, so
+                this re-run is unavoidable -- cached in `forced_predictions`
+                so it only happens once).
 
-  STRICT  -- score only rows the model called negative/positive; neutral
-             predictions count as abstentions. Reports accuracy + coverage.
-  FORCED  -- every labeled row gets a 2-way call. Rows already predicted
-             negative/positive keep that call (whichever of neg/pos beat
-             the other also beat neutral, so it's still the 2-way winner).
-             Neutral rows are re-run picking whichever of P(neg)/P(pos) is
-             higher. predictions only stores the winning label, not full
-             probabilities, so this re-run is unavoidable -- results are
-             cached in `forced_predictions` so it only happens once.
+--model finetuned -- the 2-class model fine-tuned by finetune.py, loaded
+    from models/roberta-sentiment140/. Natively 2-way, so a single report.
+
+Both modes cache their predictions in `predictions` (keyed by model_name),
+so rerunning evaluate.py is cheap after the first pass.
 
 Usage:
-    python src/evaluate.py
+    python src/evaluate.py                    # zero-shot (default)
+    python src/evaluate.py --model finetuned   # fine-tuned model
 """
 
+import argparse
 import time
+from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
 import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-from classify_sentiment import MODEL_NAME, BATCH_SIZE, MAX_TOKENS, DB, load_model
+from classify_sentiment import (
+    MODEL_NAME, BATCH_SIZE, MAX_TOKENS, DB,
+    load_model, classify_texts, ensure_predictions_table, write_batch,
+)
 
 TARGET_ACCURACY = 0.85
 RAW_LABEL_TO_GROUND_TRUTH = {0: "negative", 4: "positive"}
+
+FINETUNED_MODEL_NAME = "roberta-sentiment140-finetuned"
+FINETUNED_MODEL_DIR = Path("models/roberta-sentiment140")
 
 # --------------------------------------------------------------------- DB SETUP
 def ensure_forced_predictions_table(conn):
@@ -49,18 +63,33 @@ def ensure_forced_predictions_table(conn):
     conn.commit()
 
 
-def fetch_labeled_predictions(conn):
-    """Twitter rows only (raw_label 0/4) with their roberta prediction."""
+def test_split_exists(conn):
+    with conn.cursor() as cur:
+        cur.execute("SELECT to_regclass('test_split')")
+        return cur.fetchone()[0] is not None
+
+
+def fetch_test_split(conn):
+    """Held-out rows written by finetune.py: (post_id, text, raw_label)."""
     q = """
-        SELECT p.post_id, p.text, p.raw_label, pr.label, pr.score
+        SELECT p.post_id, p.text, p.raw_label
         FROM posts p
-        JOIN predictions pr
-          ON pr.post_id = p.post_id AND pr.model_name = %s
-        WHERE p.raw_label IN (0, 4)
+        JOIN test_split t ON t.post_id = p.post_id
+        ORDER BY p.post_id
     """
     with conn.cursor() as cur:
-        cur.execute(q, [MODEL_NAME])
-        return cur.fetchall()   # (post_id, text, raw_label, label, score)
+        cur.execute(q)
+        return cur.fetchall()
+
+
+def fetch_predictions(conn, model_name, post_ids):
+    q = """
+        SELECT post_id, label, score FROM predictions
+        WHERE model_name = %s AND post_id = ANY(%s)
+    """
+    with conn.cursor() as cur:
+        cur.execute(q, [model_name, list(post_ids)])
+        return {pid: (label, score) for pid, label, score in cur.fetchall()}
 
 
 def fetch_cached_forced(conn, post_ids):
@@ -81,16 +110,44 @@ def write_forced_batch(conn, rows):
         psycopg2.extras.execute_values(
             cur,
             """INSERT INTO forced_predictions (post_id, model_name, label, score)
-               VALUES %s
-               ON CONFLICT (post_id, model_name) DO NOTHING""",
+               VALUES %s ON CONFLICT (post_id, model_name) DO NOTHING""",
             rows, page_size=1000,
         )
     conn.commit()
 
-# ------------------------------------------------------------------ MODEL (2-way)
+# --------------------------------------------------------------------- INFERENCE
+def ensure_classified(conn, model_name, rows, classify_fn, tok, model, desc):
+    """rows: list of (post_id, text). Classifies any post_id missing from
+    `predictions` for model_name, writes results, returns the full
+    {post_id: (label, score)} map covering all of rows."""
+    ids = [pid for pid, _ in rows]
+    have = fetch_predictions(conn, model_name, ids)
+    missing = [(pid, text) for pid, text in rows if pid not in have]
+    if not missing:
+        return have
+
+    print(f"{desc}: classifying {len(missing):,} test rows not yet in predictions cache")
+    total = len(missing)
+    done = 0
+    t0 = time.time()
+    for i in range(0, total, BATCH_SIZE):
+        chunk = missing[i:i + BATCH_SIZE]
+        ids_chunk = [r[0] for r in chunk]
+        texts_chunk = [r[1] for r in chunk]
+        preds = classify_fn(texts_chunk, tok, model)
+        write_batch(conn, [(pid, model_name, label, score)
+                           for pid, (label, score) in zip(ids_chunk, preds)])
+        have.update({pid: (label, score) for pid, (label, score) in zip(ids_chunk, preds)})
+        done += len(chunk)
+        if done % (BATCH_SIZE * 10) == 0 or done == total:
+            rate = done / (time.time() - t0)
+            print(f"  {done:,}/{total:,}  ({rate:.0f} rows/s)")
+    return have
+
+
 @torch.no_grad()
 def classify_forced(texts, tok, model):
-    """Force a neg/pos call, ignoring the neutral class entirely."""
+    """Force a neg/pos call on the 3-class zero-shot model, ignoring neutral."""
     enc = tok(texts, padding=True, truncation=True,
               max_length=MAX_TOKENS, return_tensors="pt")
     logits = model(**enc).logits
@@ -101,8 +158,8 @@ def classify_forced(texts, tok, model):
 
 
 def compute_forced_labels(conn, rows):
-    """rows: (post_id, text, raw_label, label, score) from fetch_labeled_predictions.
-    Returns dict post_id -> forced 2-way label."""
+    """rows: (post_id, text, raw_label, label, score) with 3-class zero-shot
+    predictions. Returns dict post_id -> forced 2-way label."""
     forced = {pid: label for pid, _, _, label, _ in rows if label != "neutral"}
 
     neutral_rows = [(pid, text) for pid, text, _, label, _ in rows if label == "neutral"]
@@ -140,6 +197,28 @@ def compute_forced_labels(conn, rows):
             print(f"  {done:,}/{total:,}  ({rate:.0f} rows/s)")
 
     return forced
+
+# ------------------------------------------------------------ MODEL (fine-tuned)
+def load_finetuned_model():
+    if not FINETUNED_MODEL_DIR.exists():
+        raise SystemExit(f"No fine-tuned model found at {FINETUNED_MODEL_DIR}. "
+                          f"Run src/finetune.py first.")
+    tok = AutoTokenizer.from_pretrained(FINETUNED_MODEL_DIR)
+    model = AutoModelForSequenceClassification.from_pretrained(FINETUNED_MODEL_DIR)
+    model.eval()
+    return tok, model
+
+
+@torch.no_grad()
+def classify_finetuned(texts, tok, model):
+    """The fine-tuned model is natively 2-class; no forced/strict split needed."""
+    enc = tok(texts, padding=True, truncation=True,
+              max_length=MAX_TOKENS, return_tensors="pt")
+    logits = model(**enc).logits
+    probs = torch.softmax(logits, dim=-1)
+    conf, idx = torch.max(probs, dim=-1)
+    return [(model.config.id2label[i.item()], round(c.item(), 4))
+            for i, c in zip(idx, conf)]
 
 # --------------------------------------------------------------------- METRICS
 def confusion_counts(pairs):
@@ -183,31 +262,53 @@ def print_report(name, pairs, total_labeled):
 
 # --------------------------------------------------------------------- MAIN
 def main():
-    conn = psycopg2.connect(**DB)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", choices=["zeroshot", "finetuned"], default="zeroshot",
+                    help="which model to score against the held-out test set")
+    args = ap.parse_args()
 
-    rows = fetch_labeled_predictions(conn)
-    total_labeled = len(rows)
-    if total_labeled == 0:
-        print("No labeled (twitter) rows with predictions found. "
-              "Run classify_sentiment.py first.")
+    conn = psycopg2.connect(**DB)
+    ensure_predictions_table(conn)
+
+    if not test_split_exists(conn):
+        print("No test_split table found. Run src/finetune.py first to "
+              "create the held-out test set.")
         conn.close()
         return
 
-    print(f"Labeled twitter rows with {MODEL_NAME} predictions: {total_labeled:,}")
+    test_rows = fetch_test_split(conn)
+    total_labeled = len(test_rows)
+    if total_labeled == 0:
+        print("test_split is empty. Run src/finetune.py first.")
+        conn.close()
+        return
 
-    strict_pairs = [
-        (RAW_LABEL_TO_GROUND_TRUTH[raw_label], label)
-        for _, _, raw_label, label, _ in rows
-        if label in ("negative", "positive")
-    ]
-    print_report("STRICT (neutral = abstain)", strict_pairs, total_labeled)
+    print(f"Held-out test set: {total_labeled:,} rows")
+    text_rows = [(pid, text) for pid, text, _ in test_rows]
 
-    forced_labels = compute_forced_labels(conn, rows)
-    forced_pairs = [
-        (RAW_LABEL_TO_GROUND_TRUTH[raw_label], forced_labels[post_id])
-        for post_id, _, raw_label, _, _ in rows
-    ]
-    print_report("FORCED (neutral re-run, 2-way)", forced_pairs, total_labeled)
+    if args.model == "zeroshot":
+        tok, model = load_model()
+        preds = ensure_classified(conn, MODEL_NAME, text_rows,
+                                   classify_texts, tok, model, "zero-shot")
+        rows = [(pid, text, raw_label, *preds[pid]) for pid, text, raw_label in test_rows]
+
+        strict_pairs = [(RAW_LABEL_TO_GROUND_TRUTH[raw_label], label)
+                        for _, _, raw_label, label, _ in rows
+                        if label in ("negative", "positive")]
+        print_report("ZERO-SHOT STRICT (neutral = abstain)", strict_pairs, total_labeled)
+
+        forced_labels = compute_forced_labels(conn, rows)
+        forced_pairs = [(RAW_LABEL_TO_GROUND_TRUTH[raw_label], forced_labels[post_id])
+                        for post_id, _, raw_label, _, _ in rows]
+        print_report("ZERO-SHOT FORCED (neutral re-run, 2-way)", forced_pairs, total_labeled)
+
+    else:
+        tok, model = load_finetuned_model()
+        preds = ensure_classified(conn, FINETUNED_MODEL_NAME, text_rows,
+                                   classify_finetuned, tok, model, "fine-tuned")
+        pairs = [(RAW_LABEL_TO_GROUND_TRUTH[raw_label], preds[pid][0])
+                for pid, _, raw_label in test_rows]
+        print_report("FINE-TUNED (2-way)", pairs, total_labeled)
 
     conn.close()
 
