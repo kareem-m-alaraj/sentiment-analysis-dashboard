@@ -45,6 +45,7 @@ LOG_EVERY = 50
 
 MODEL_DIR = Path("models/roberta-sentiment140")
 CHECKPOINT_DIR = MODEL_DIR / "checkpoints"
+FINETUNED_MODEL_NAME = "roberta-sentiment140-finetuned"   # predictions.model_name key
 
 LABEL2ID = {0: 0, 4: 1}            # raw_label -> training class id
 ID2LABEL = {0: "negative", 1: "positive"}

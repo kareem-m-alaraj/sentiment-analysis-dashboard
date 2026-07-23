@@ -29,7 +29,6 @@ Usage:
 
 import argparse
 import time
-from pathlib import Path
 
 import psycopg2
 import psycopg2.extras
@@ -40,12 +39,10 @@ from classify_sentiment import (
     MODEL_NAME, BATCH_SIZE, MAX_TOKENS, DB,
     load_model, classify_texts, ensure_predictions_table, write_batch,
 )
+from finetune import FINETUNED_MODEL_NAME, MODEL_DIR as FINETUNED_MODEL_DIR
 
 TARGET_ACCURACY = 0.85
 RAW_LABEL_TO_GROUND_TRUTH = {0: "negative", 4: "positive"}
-
-FINETUNED_MODEL_NAME = "roberta-sentiment140-finetuned"
-FINETUNED_MODEL_DIR = Path("models/roberta-sentiment140")
 
 # --------------------------------------------------------------------- DB SETUP
 def ensure_forced_predictions_table(conn):
