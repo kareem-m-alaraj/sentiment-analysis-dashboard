@@ -1,5 +1,9 @@
 # Sentiment Analysis Dashboard
 
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://alaraj-sentiment-analysis-dashboard.streamlit.app)
+
+**Live app: https://alaraj-sentiment-analysis-dashboard.streamlit.app**
+
 An ETL + ML pipeline that normalizes Reddit posts (r/technology, r/wallstreetbets)
 and Twitter posts (the sentiment140 dataset) into a shared Postgres schema,
 classifies each post's sentiment with a transformer model, and exposes the
@@ -97,6 +101,10 @@ over the fine-tuned model's forced, sometimes falsely confident,
 negative/positive call on sentiment-free text.
 
 ## Deployment
+
+Live at **https://alaraj-sentiment-analysis-dashboard.streamlit.app**, deployed
+on Streamlit Community Cloud from this repo's `main` branch (`src/dashboard.py`
+as the entrypoint).
 
 Two requirements files:
 
