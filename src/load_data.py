@@ -13,6 +13,7 @@ Schema (matches DB table `posts`):
     raw_label  INTEGER    twitter: 0/4; reddit: NULL
 """
 
+import html
 import os
 from pathlib import Path
 
@@ -55,7 +56,7 @@ def load_reddit(filename: str) -> pd.DataFrame:
     df = pd.read_csv(RAW_DIR / filename)
     title = df["title"].fillna("").astype(str)
     body  = df.get("body", pd.Series([""] * len(df))).fillna("").astype(str)
-    text  = title.where(title.str.strip() != "", body)
+    text  = title.where(title.str.strip() != "", body).apply(html.unescape)
 
     out = pd.DataFrame({
         "post_id":    "reddit_" + df["id"].astype(str),
@@ -81,7 +82,7 @@ def load_sentiment140() -> pd.DataFrame:
     out = pd.DataFrame({
         "post_id":    "tw_" + df["id"].astype(str),
         "source":     "twitter",
-        "text":       df["text"].astype(str),
+        "text":       df["text"].astype(str).apply(html.unescape),
         "created_at": created,
         "raw_label":  df["target"],
     })
