@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 
 import pandas as pd
-import psycopg2
 import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
@@ -81,6 +80,14 @@ def load_data() -> pd.DataFrame:
     if PARQUET_PATH.exists():
         df = pd.read_parquet(PARQUET_PATH)
     else:
+        try:
+            import psycopg2
+        except ImportError as e:
+            raise RuntimeError(
+                f"{PARQUET_PATH} is missing and psycopg2 isn't installed. "
+                "Run src/export_snapshot.py to generate the parquet snapshot, "
+                "or install psycopg2-binary to query Postgres directly."
+            ) from e
         conn = psycopg2.connect(**DB)
         df = pd.read_sql(QUERY, conn)
         conn.close()
