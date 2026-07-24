@@ -1,5 +1,13 @@
 # Sentiment Analysis Dashboard
 
+An ETL + ML pipeline that normalizes Reddit posts (r/technology, r/wallstreetbets)
+and Twitter posts (the sentiment140 dataset) into a shared Postgres schema,
+classifies each post's sentiment with a transformer model, and exposes the
+result through a Streamlit dashboard. Two models are compared: the pretrained
+`cardiffnlp/twitter-roberta-base-sentiment-latest` (3-class, zero-shot) and a
+version of the same checkpoint fine-tuned into a 2-class head on sentiment140's
+labels. Built with Python, pandas, psycopg2, PyTorch/Transformers, and Streamlit.
+
 ## Findings
 
 Evaluation results so far. Ground truth is sentiment140's emoticon-derived
@@ -26,22 +34,31 @@ figure is comparable to the fine-tuned model's score, below.
 
 The 3-class head was replaced with a 2-class (negative/positive) head and
 fine-tuned for 1 epoch on 20,000 sentiment140 rows (10,000/class). It scores
-**86.76%** accuracy on the same 10,000-row held-out `test_split` (5,000/class)
+**86.77%** accuracy on the same 10,000-row held-out `test_split` (5,000/class)
 used for the zero-shot comparison above.
 
 The test post_ids were written to the `test_split` table before training
 started and never regenerated; a direct check confirmed zero overlap
 between the training set and `test_split`.
 
-**86.76% (fine-tuned) vs. 81.27% (zero-shot strict) is the valid head-to-head
+**86.77% (fine-tuned) vs. 81.27% (zero-shot strict) is the valid head-to-head
 comparison** — both are scored on the identical 10,000 rows. The 81.65%
-full-set figure above is not comparable to 86.76%; it's a different, larger
+full-set figure above is not comparable to 86.77%; it's a different, larger
 population that overlaps with the fine-tuned model's training data.
 
-86.76% applies only to the 10,000-row held-out split — 20,000 of the
+86.77% applies only to the 10,000-row held-out split — 20,000 of the
 ~50,000 twitter rows in the corpus were used as training data for this
 model, so the same accuracy figure does not describe the full displayed
 corpus.
+
+### Data cleaning: HTML entities
+
+3,038 posts (2.92% of the corpus) carried un-unescaped HTML entities
+(`&quot;`, `&amp;`, `&lt;`, `&gt;`) left over from the source CSVs. These
+were cleaned in place and re-classified by both models; `load_data.py` now
+unescapes on load so future imports are unaffected. The fine-tuned accuracy
+moved by exactly one row (86.76% → 86.77%) — the cleanup had no material
+effect on model performance.
 
 ### Zero-shot vs. fine-tuned agreement
 
@@ -78,3 +95,18 @@ majority of the displayed corpus and has no ground-truth labels; the
 zero-shot model's ability to abstain (predict neutral) is preferred there
 over the fine-tuned model's forced, sometimes falsely confident,
 negative/positive call on sentiment-free text.
+
+## Deployment
+
+Two requirements files:
+
+- `requirements.txt` — full dev set (load/train/classify/evaluate + dashboard).
+  Includes `torch` and `transformers` for running the models locally.
+- `requirements-dashboard.txt` — only what `src/dashboard.py` imports at
+  runtime. No `torch`/`transformers`: the dashboard reads predictions
+  already written to `data/processed/dashboard.parquet` (or Postgres) and
+  never loads a model itself.
+
+**HF Spaces installs from `requirements-dashboard.txt`** — pulling in
+`torch`/`transformers` there would mean ~3GB of unused CUDA wheels for an
+app that never runs inference.
