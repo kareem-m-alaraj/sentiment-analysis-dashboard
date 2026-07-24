@@ -100,13 +100,20 @@ negative/positive call on sentiment-free text.
 
 Two requirements files:
 
-- `requirements.txt` — full dev set (load/train/classify/evaluate + dashboard).
-  Includes `torch` and `transformers` for running the models locally.
-- `requirements-dashboard.txt` — only what `src/dashboard.py` imports at
-  runtime. No `torch`/`transformers`: the dashboard reads predictions
-  already written to `data/processed/dashboard.parquet` (or Postgres) and
-  never loads a model itself.
+- `requirements.txt` — only what `src/dashboard.py` imports at runtime. No
+  `torch`/`transformers`: the dashboard reads predictions already written to
+  `data/processed/dashboard.parquet` (or Postgres) and never loads a model
+  itself. **This is the file Streamlit Community Cloud installs from** — it
+  reads a file named exactly `requirements.txt` at the repo root, with no way
+  to point it at an alternate filename, so the runtime-only set has to live
+  at that path.
+- `requirements-dev.txt` — full dev set (load/train/classify/evaluate +
+  dashboard). Includes `torch`, `transformers`, and `psycopg2-binary` for
+  running the models locally: `pip install -r requirements-dev.txt`.
 
-**HF Spaces installs from `requirements-dashboard.txt`** — pulling in
-`torch`/`transformers` there would mean ~3GB of unused CUDA wheels for an
-app that never runs inference.
+Running `pip install -r requirements.txt` alone will not give you `torch` —
+use `requirements-dev.txt` for local model work.
+
+`data/processed/dashboard.parquet` is committed (see `.gitignore`) so the
+deployed app has data to read without a database — Streamlit Community Cloud
+has no Postgres of its own.

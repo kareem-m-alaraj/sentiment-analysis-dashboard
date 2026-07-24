@@ -3,7 +3,7 @@ export_snapshot.py
 Dumps the posts + predictions join that dashboard.py reads to a parquet
 snapshot at data/processed/dashboard.parquet. dashboard.py prefers this file
 when present and only falls back to Postgres if it's missing -- Week 4 deploys
-to HF Spaces, which has no database.
+to Streamlit Community Cloud, which has no database.
 
 Usage:
     python src/export_snapshot.py

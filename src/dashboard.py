@@ -2,9 +2,9 @@
 dashboard.py
 Streamlit dashboard over the posts + predictions join produced by
 export_snapshot.py. Prefers data/processed/dashboard.parquet when present
-and falls back to querying Postgres directly -- Week 4 deploys to HF Spaces,
-which has no database, so the parquet snapshot must be committed/uploaded
-alongside the app.
+and falls back to querying Postgres directly -- Week 4 deploys to Streamlit
+Community Cloud, which has no database, so the parquet snapshot is committed
+to the repo alongside the app.
 
 Usage:
     streamlit run src/dashboard.py

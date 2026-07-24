@@ -35,10 +35,9 @@ wheels/
 *~
 
 # Data
-data/raw/*
+data/*
+!data/processed/
 data/processed/*
-!data/raw/.gitkeep
-!data/processed/.gitkeep
 !data/processed/dashboard.parquet
 
 # Models
