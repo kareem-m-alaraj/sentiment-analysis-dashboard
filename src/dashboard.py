@@ -23,6 +23,7 @@ from wordcloud import WordCloud, STOPWORDS
 load_dotenv()
 
 PARQUET_PATH = Path("data/processed/dashboard.parquet")
+LIVE_HN_DIR = Path("data/live/hn")
 
 DB = dict(
     dbname=os.environ.get("DB_NAME"),
@@ -91,6 +92,14 @@ def load_data() -> pd.DataFrame:
         conn = psycopg2.connect(**DB)
         df = pd.read_sql(QUERY, conn)
         conn.close()
+    df["is_live"] = False
+
+    live_files = sorted(LIVE_HN_DIR.glob("*.parquet"))
+    if live_files:
+        live_df = pd.concat([pd.read_parquet(f) for f in live_files], ignore_index=True)
+        live_df["is_live"] = True
+        df = pd.concat([df, live_df], ignore_index=True)
+
     df["created_at"] = pd.to_datetime(df["created_at"])
     return df
 
@@ -110,6 +119,10 @@ st.sidebar.header("Filters")
 
 model_label = st.sidebar.selectbox("Model", list(MODEL_CHOICES.keys()), index=0)
 model_name = MODEL_CHOICES[model_label]
+st.sidebar.caption(
+    "Live Hacker News rows are only scored by the zero-shot model — "
+    "switching to the fine-tuned model hides them from every chart."
+)
 mdf = df[df["model_name"] == model_name]
 
 sources = sorted(df["source"].unique())
