@@ -39,6 +39,9 @@ data/*
 !data/processed/
 data/processed/*
 !data/processed/dashboard.parquet
+!data/live/
+!data/live/hn/
+!data/live/hn/*.parquet
 
 # Models
 models/
