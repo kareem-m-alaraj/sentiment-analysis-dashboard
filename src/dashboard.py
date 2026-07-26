@@ -179,7 +179,7 @@ st.caption("Twitter and reddit cover very different date ranges and volumes "
            "years of 2020-2022 at ~68 posts/day), so each gets its own chart "
            "and its own time bucket.")
 
-TIME_FREQ = {"twitter": ("D", "day"), "reddit": ("W", "week")}
+TIME_FREQ = {"twitter": ("D", "day"), "reddit": ("W", "week"), "hackernews": ("D", "day")}
 reddit_log_scale = False
 if "reddit" in selected_sources:
     reddit_log_scale = st.checkbox(
@@ -187,7 +187,7 @@ if "reddit" in selected_sources:
         value=False,
     )
 
-for source in [s for s in ["twitter", "reddit"] if s in selected_sources]:
+for source in [s for s in ["twitter", "reddit", "hackernews"] if s in selected_sources]:
     sdf = filtered[filtered["source"] == source]
     if sdf.empty:
         continue
