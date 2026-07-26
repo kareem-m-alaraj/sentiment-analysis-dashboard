@@ -174,13 +174,20 @@ def insert_rows(rows) -> int:
 
 # -------------------------------------------------------------- PARQUET SINK
 def write_parquet_sink(rows):
-    """Writes today's UTC-dated partition to LIVE_DIR, deduped against the
-    last DEDUPE_LOOKBACK_DAYS partitions if present. Never touches Postgres.
-    Returns (written, deduped, out_path)."""
+    """Writes today's UTC-dated partition to LIVE_DIR: merges with today's
+    existing partition if present (so repeat same-day runs accumulate rather
+    than overwrite), then drops anything already seen in the prior
+    DEDUPE_LOOKBACK_DAYS partitions. Never touches Postgres. Returns
+    (written, deduped, out_path)."""
     import pandas as pd
 
     today = datetime.now(timezone.utc).date()
     out_path = LIVE_DIR / f"{today.isoformat()}.parquet"
+
+    df = pd.DataFrame(rows)
+    if out_path.exists():
+        df = pd.concat([pd.read_parquet(out_path), df], ignore_index=True)
+        df = df.drop_duplicates(subset="post_id", keep="last")
 
     existing_ids = set()
     for days_back in range(1, DEDUPE_LOOKBACK_DAYS + 1):
@@ -188,7 +195,6 @@ def write_parquet_sink(rows):
         if prior.exists():
             existing_ids.update(pd.read_parquet(prior, columns=["post_id"])["post_id"])
 
-    df = pd.DataFrame(rows)
     before = len(df)
     df = df[~df["post_id"].isin(existing_ids)].reset_index(drop=True)
     deduped = before - len(df)
