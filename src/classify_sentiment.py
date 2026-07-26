@@ -18,7 +18,7 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-from sentiment_model import MODEL_NAME, load_model, classify_texts
+from sentiment_model import MODEL_NAME, MAX_TOKENS, load_model, classify_texts
 
 # --------------------------------------------------------------------- CONFIG
 load_dotenv()
