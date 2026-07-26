@@ -17,18 +17,13 @@ import time
 import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
-import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+from sentiment_model import MODEL_NAME, load_model, classify_texts
 
 # --------------------------------------------------------------------- CONFIG
 load_dotenv()
 
-MODEL_NAME = "cardiffnlp/twitter-roberta-base-sentiment-latest"
-# model's own label order for this checkpoint: 0=neg, 1=neu, 2=pos
-ID2LABEL = {0: "negative", 1: "neutral", 2: "positive"}
-
 BATCH_SIZE = 32          # rows per forward pass; safe for CPU RAM
-MAX_TOKENS = 128         # tweets/reddit titles are short; 128 is plenty
 DB = dict(
     dbname=os.environ["DB_NAME"],
     user=os.environ["DB_USER"],
@@ -84,25 +79,6 @@ def write_batch(conn, rows):
         )
     conn.commit()
 
-# --------------------------------------------------------------------- MODEL
-def load_model():
-    tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
-    model.eval()
-    return tok, model
-
-
-@torch.no_grad()
-def classify_texts(texts, tok, model):
-    """Returns list of (label, score) aligned with input texts."""
-    enc = tok(texts, padding=True, truncation=True,
-              max_length=MAX_TOKENS, return_tensors="pt")
-    logits = model(**enc).logits
-    probs = torch.softmax(logits, dim=-1)
-    conf, idx = torch.max(probs, dim=-1)
-    return [(ID2LABEL[i.item()], round(c.item(), 4))
-            for i, c in zip(idx, conf)]
-
 # --------------------------------------------------------------------- MAIN
 def main():
     ap = argparse.ArgumentParser()
@@ -114,7 +90,7 @@ def main():
 
     print(f"Loading model: {MODEL_NAME}")
     print("(first run downloads ~500MB — one time, then cached)\n")
-    tok, model = load_model()
+    load_model()
 
     conn = psycopg2.connect(**DB)
     ensure_predictions_table(conn)
@@ -127,7 +103,7 @@ def main():
             conn.close()
             return
         ids, texts = zip(*rows)
-        preds = classify_texts(list(texts), tok, model)
+        preds = classify_texts(list(texts))
         print(f"{'LABEL':<9} {'SCORE':<7} TEXT")
         print("-" * 80)
         for (label, score), txt in zip(preds, texts):
@@ -152,7 +128,7 @@ def main():
         chunk = rows[i:i + BATCH_SIZE]
         ids = [r[0] for r in chunk]
         texts = [r[1] for r in chunk]
-        preds = classify_texts(texts, tok, model)
+        preds = classify_texts(texts)
         batch = [(pid, MODEL_NAME, label, score)
                  for pid, (label, score) in zip(ids, preds)]
         write_batch(conn, batch)          # commit per batch = resumable
