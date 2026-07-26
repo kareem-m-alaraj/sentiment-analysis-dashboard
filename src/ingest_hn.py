@@ -16,9 +16,13 @@ default, so existing behaviour is unchanged). --sink parquet never imports
 psycopg2 and never touches Postgres, so it can run in environments (e.g. a
 scheduled Action) that have no database access.
 
-Does not classify -- classify_sentiment.py's unclassified-row query picks up
-hackernews posts the same way it picks up reddit/twitter ones, once they're
-in `posts`.
+--sink postgres does not classify -- classify_sentiment.py's unclassified-row
+query picks up hackernews posts the same way it picks up reddit/twitter ones,
+once they're in `posts`. --sink parquet classifies inline via
+sentiment_model.classify_texts, because its output must match
+data/processed/dashboard.parquet's columns (posts JOIN predictions), which
+the dashboard reads directly and has no separate predictions table to defer
+to.
 """
 
 import argparse
@@ -173,18 +177,32 @@ def insert_rows(rows) -> int:
     return inserted
 
 # -------------------------------------------------------------- PARQUET SINK
+# Matches data/processed/dashboard.parquet's columns (posts JOIN predictions),
+# not the posts table itself -- no raw_label, but with model_name/label/score
+# so live rows can be concatenated straight into the dashboard's data.
+PARQUET_COLUMNS = ["post_id", "source", "topic", "text", "created_at",
+                   "model_name", "label", "score"]
+
+
 def write_parquet_sink(rows):
-    """Writes today's UTC-dated partition to LIVE_DIR: merges with today's
-    existing partition if present (so repeat same-day runs accumulate rather
-    than overwrite), then drops anything already seen in the prior
-    DEDUPE_LOOKBACK_DAYS partitions. Never touches Postgres. Returns
-    (written, deduped, out_path)."""
+    """Classifies rows, then writes today's UTC-dated partition to LIVE_DIR:
+    merges with today's existing partition if present (so repeat same-day
+    runs accumulate rather than overwrite), then drops anything already seen
+    in the prior DEDUPE_LOOKBACK_DAYS partitions. Never touches Postgres.
+    Returns (written, deduped, out_path)."""
     import pandas as pd
+    from sentiment_model import MODEL_NAME, classify_texts
+
+    preds = classify_texts([r["text"] for r in rows])
+    for r, (label, score) in zip(rows, preds):
+        r["model_name"] = MODEL_NAME
+        r["label"] = label
+        r["score"] = score
 
     today = datetime.now(timezone.utc).date()
     out_path = LIVE_DIR / f"{today.isoformat()}.parquet"
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=PARQUET_COLUMNS)
     if out_path.exists():
         df = pd.concat([pd.read_parquet(out_path), df], ignore_index=True)
         df = df.drop_duplicates(subset="post_id", keep="last")
