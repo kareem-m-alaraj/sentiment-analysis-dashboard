@@ -1,16 +1,24 @@
 """
 ingest_hn.py
 Pulls current front-page-eligible stories from the HN Firebase API
-(https://hacker-news.firebaseio.com/v0/, no auth) and inserts them into the
-existing `posts` table alongside reddit/twitter rows.
+(https://hacker-news.firebaseio.com/v0/, no auth) and writes them to either
+the `posts` table or a local parquet partition.
 
 Usage:
-    python src/ingest_hn.py                # fetch, insert, report counts
-    python src/ingest_hn.py --limit 50     # only process the first 50 story ids
-    python src/ingest_hn.py --dry-run      # fetch + build rows, no DB write
+    python src/ingest_hn.py                          # fetch, insert into postgres
+    python src/ingest_hn.py --sink parquet            # fetch, write data/live/hn/<date>.parquet
+    python src/ingest_hn.py --limit 50                # only process the first 50 story ids
+    python src/ingest_hn.py --dry-run                 # fetch + build rows, no write
 
-Does not classify — classify_sentiment.py's unclassified-row query picks up
-hackernews posts the same way it picks up reddit/twitter ones.
+Fetching/cleaning/tagging (fetch_hn_rows) has no DB dependency -- only
+insert_rows() touches Postgres, and only when --sink postgres is used (the
+default, so existing behaviour is unchanged). --sink parquet never imports
+psycopg2 and never touches Postgres, so it can run in environments (e.g. a
+scheduled Action) that have no database access.
+
+Does not classify -- classify_sentiment.py's unclassified-row query picks up
+hackernews posts the same way it picks up reddit/twitter ones, once they're
+in `posts`.
 """
 
 import argparse
@@ -19,11 +27,10 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-import psycopg2
 import requests
-from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
 from topics import tag_topic
@@ -34,6 +41,9 @@ API_BASE = "https://hacker-news.firebaseio.com/v0"
 MAX_WORKERS = 15
 FETCH_TIMEOUT = 10       # seconds per request
 FETCH_RETRIES = 2        # additional attempts after the first
+
+LIVE_DIR = Path("data/live/hn")
+DEDUPE_LOOKBACK_DAYS = 2  # check this many prior daily partitions for dupes
 
 TAG_RE = re.compile(r"<[^>]+>")
 WS_RE = re.compile(r"\s+")
@@ -81,8 +91,9 @@ def clean_html(raw: str) -> str:
 
 # ------------------------------------------------------------------ ROW BUILD
 def build_rows(items):
-    """Returns (rows, skipped_filtered, skipped_empty). rows match the posts
-    schema: (post_id, source, topic, text, created_at, raw_label)."""
+    """Returns (rows, skipped_filtered, skipped_empty). rows are dicts
+    matching the posts schema: post_id, source, topic, text, created_at,
+    raw_label."""
     rows, skipped_filtered, skipped_empty = [], 0, 0
     for item in items:
         if item.get("type") != "story" or item.get("dead") or item.get("deleted"):
@@ -100,49 +111,22 @@ def build_rows(items):
             datetime.fromtimestamp(item["time"], tz=timezone.utc).replace(tzinfo=None)
             if item.get("time") else None
         )
-        rows.append((
-            f"hn_{item['id']}",
-            "hackernews",
-            tag_topic(text),
-            text,
-            created_at,
-            None,
-        ))
+        rows.append({
+            "post_id":    f"hn_{item['id']}",
+            "source":     "hackernews",
+            "topic":      tag_topic(text),
+            "text":       text,
+            "created_at": created_at,
+            "raw_label":  None,
+        })
     return rows, skipped_filtered, skipped_empty
 
-# ------------------------------------------------------------------ DB WRITE
-def insert_rows(rows) -> int:
-    """Inserts rows, ON CONFLICT DO NOTHING. Returns count actually inserted."""
-    load_dotenv()
-    conn = psycopg2.connect(
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        host=os.getenv("DB_HOST", "localhost"),
-        port=os.getenv("DB_PORT", "5432"),
-    )
-    with conn, conn.cursor() as cur:
-        execute_values(
-            cur,
-            "INSERT INTO posts (post_id, source, topic, text, created_at, raw_label) "
-            "VALUES %s ON CONFLICT (post_id) DO NOTHING",
-            rows, page_size=len(rows),   # single page => rowcount is accurate
-        )
-        inserted = cur.rowcount
-    conn.close()
-    return inserted
 
-# --------------------------------------------------------------------- MAIN
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=None,
-                    help="only process the first N new story ids")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="fetch and build rows, no DB write")
-    args = ap.parse_args()
-
+def fetch_hn_rows(limit=None):
+    """Fetch, clean, and topic-tag current HN stories. No DB dependency --
+    returns (rows, stats). rows are dicts, ready for either sink."""
     print("Fetching new story ids...")
-    ids = fetch_new_story_ids(args.limit)
+    ids = fetch_new_story_ids(limit)
     print(f"  {len(ids)} ids to fetch\n")
 
     print(f"Fetching item details ({MAX_WORKERS} workers)...")
@@ -154,20 +138,97 @@ def main():
           f"({skipped_filtered} skipped non-story/dead/deleted, "
           f"{skipped_empty} skipped empty text)\n")
 
+    stats = {
+        "ids": len(ids), "fetched": len(items), "failed": failed,
+        "skipped_filtered": skipped_filtered, "skipped_empty": skipped_empty,
+    }
+    return rows, stats
+
+# ------------------------------------------------------------------ DB SINK
+def insert_rows(rows) -> int:
+    """Inserts rows into Postgres, ON CONFLICT DO NOTHING. Returns count
+    actually inserted. Only sink that touches Postgres."""
+    import psycopg2
+    from psycopg2.extras import execute_values
+
+    load_dotenv()
+    conn = psycopg2.connect(
+        dbname=os.getenv("DB_NAME"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        host=os.getenv("DB_HOST", "localhost"),
+        port=os.getenv("DB_PORT", "5432"),
+    )
+    cols = ["post_id", "source", "topic", "text", "created_at", "raw_label"]
+    records = [tuple(r[c] for c in cols) for r in rows]
+    with conn, conn.cursor() as cur:
+        execute_values(
+            cur,
+            "INSERT INTO posts (post_id, source, topic, text, created_at, raw_label) "
+            "VALUES %s ON CONFLICT (post_id) DO NOTHING",
+            records, page_size=len(records),   # single page => rowcount is accurate
+        )
+        inserted = cur.rowcount
+    conn.close()
+    return inserted
+
+# -------------------------------------------------------------- PARQUET SINK
+def write_parquet_sink(rows):
+    """Writes today's UTC-dated partition to LIVE_DIR, deduped against the
+    last DEDUPE_LOOKBACK_DAYS partitions if present. Never touches Postgres.
+    Returns (written, deduped, out_path)."""
+    import pandas as pd
+
+    today = datetime.now(timezone.utc).date()
+    out_path = LIVE_DIR / f"{today.isoformat()}.parquet"
+
+    existing_ids = set()
+    for days_back in range(1, DEDUPE_LOOKBACK_DAYS + 1):
+        prior = LIVE_DIR / f"{(today - timedelta(days=days_back)).isoformat()}.parquet"
+        if prior.exists():
+            existing_ids.update(pd.read_parquet(prior, columns=["post_id"])["post_id"])
+
+    df = pd.DataFrame(rows)
+    before = len(df)
+    df = df[~df["post_id"].isin(existing_ids)].reset_index(drop=True)
+    deduped = before - len(df)
+
+    LIVE_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(out_path, index=False)
+    return len(df), deduped, out_path
+
+# --------------------------------------------------------------------- MAIN
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--limit", type=int, default=None,
+                    help="only process the first N new story ids")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="fetch and build rows, no write")
+    ap.add_argument("--sink", choices=["postgres", "parquet"], default="postgres",
+                    help="where rows are written (default: postgres)")
+    args = ap.parse_args()
+
+    rows, _ = fetch_hn_rows(args.limit)
+
     if not rows:
-        print("Nothing to insert.")
+        print("Nothing to write.")
         return
 
     if args.dry_run:
-        print(f"[dry-run] would attempt to insert {len(rows)} rows. Sample:")
+        print(f"[dry-run] would write {len(rows)} rows via --sink={args.sink}. Sample:")
         for r in rows[:5]:
-            print(f"  {r[0]:<12} [{r[2]:<10}] {r[3][:70]}")
+            print(f"  {r['post_id']:<12} [{r['topic']:<10}] {r['text'][:70]}")
         return
 
-    inserted = insert_rows(rows)
-    duplicates = len(rows) - inserted
-    print(f"Inserted {inserted:,}, {duplicates:,} duplicates skipped "
-          f"(already in posts).")
+    if args.sink == "postgres":
+        inserted = insert_rows(rows)
+        duplicates = len(rows) - inserted
+        print(f"Inserted {inserted:,}, {duplicates:,} duplicates skipped "
+              f"(already in posts).")
+    else:
+        written, deduped, out_path = write_parquet_sink(rows)
+        print(f"Wrote {written:,} rows -> {out_path} "
+              f"({deduped:,} deduped against last {DEDUPE_LOOKBACK_DAYS} days).")
 
 
 if __name__ == "__main__":
