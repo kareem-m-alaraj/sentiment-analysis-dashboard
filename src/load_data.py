@@ -22,6 +22,8 @@ import psycopg2
 from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
+from topics import tag_topic
+
 # ---------------------------------------------------------------- CONFIG ----
 RAW_DIR       = Path("data/raw")
 PROCESSED_DIR = Path("data/processed")
@@ -34,22 +36,6 @@ SENTIMENT140_SAMPLE = 50_000
 # Which reddit column holds the readable date. If reddit created_at comes back
 # mostly NULL after a run (diagnostics print this), flip to "created" and re-run.
 REDDIT_DATE_COL = "timestamp"
-
-# ------------------------------------------------------------ TOPIC TAGGING -
-TOPIC_KEYWORDS = {
-    "android":    ["android", "pixel", "samsung", "galaxy"],
-    "nvidia":     ["nvidia", "geforce", "rtx", "cuda"],
-    "bmw":        ["bmw", "m3", "m5", "bimmer"],
-    "investing":  ["invest", "stock", "market", "shares", "portfolio", "wsb"],
-    "technology": ["tech", "software", "hardware", "chip", "ai", "app"],
-}
-
-def tag_topic(text: str) -> str:
-    t = (text or "").lower()
-    for topic, kws in TOPIC_KEYWORDS.items():
-        if any(kw in t for kw in kws):
-            return topic
-    return "general"
 
 # ------------------------------------------------------------------ LOADERS -
 def load_reddit(filename: str) -> pd.DataFrame:
